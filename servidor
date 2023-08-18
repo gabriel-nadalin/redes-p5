@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+from ip import IP
+from slip import CamadaEnlace
+from camadafisica import PTY
+import re
+
+nicks = {}
+canais = {}
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+def usuarios_canal_comum(conexao):
+    lista = []
+    for canal in canais:
+        if conexao in canais[canal]:
+            lista.extend(usuario for usuario in canais[canal] if (usuario not in lista and usuario != conexao))
+    return lista
+
+
+def sair(conexao):
+    print(conexao, 'conexão fechada')
+    for conexao_dest in usuarios_canal_comum(conexao):
+        conexao_dest.enviar(b':' + nicks[conexao] + b' QUIT :Connection closed\r\n')
+    for canal in canais:
+        if conexao in canais[canal]:
+            canais[canal].remove(conexao)
+    if conexao in nicks:
+        nicks.pop(conexao)
+    conexao.fechar()
+
+
+def dados_recebidos(conexao, dados):
+    if dados == b'':
+        return sair(conexao)
+    dados = conexao.res + dados
+    conexao.res = b''
+    print(conexao, dados)
+    
+    if dados[-1] != b'\n':
+        dados = dados.split(b'\r\n')
+        conexao.res = dados[-1]
+        del dados[-1]
+    else:
+        dados = dados.split(b'\r\n')
+
+    for dado in dados:
+        dado = dado.split(b' ', 2)
+        
+        if dado[0] == b'PING':
+            conexao.enviar(b':server PONG server :' + dado[1] + b'\r\n')
+            
+        elif dado[0] == b'NICK':
+            if conexao not in nicks: 
+                if dado[1].lower() in [nick.lower() for nick in nicks.values()]:
+                    conexao.enviar(b':server 433 * ' + dado[1] + b' :Nickname is already in use\r\n')
+                elif validar_nome(dado[1]):
+                    conexao.enviar(b':server 001 ' + dado[1] + b' :Welcome\r\n')
+                    conexao.enviar(b':server 422 ' + dado[1] + b' :MOTD File is missing\r\n')
+                    nicks[conexao] = dado[1]
+                else:
+                    conexao.enviar(b':server 432 * ' + dado[1] + b' :Erroneous nickname\r\n')
+            else:
+                if dado[1].lower() in [nick.lower() for nick in nicks.values()]:
+                    conexao.enviar(b':server 433 ' + nicks[conexao] + b' ' + dado[1] + b' :Nickname is already in use\r\n')
+                elif validar_nome(dado[1]):
+                    lista_dest = usuarios_canal_comum(conexao)
+                    for conexao_dest in lista_dest:
+                        conexao_dest.enviar(b':' + nicks[conexao] + b' NICK ' + dado[1] + b'\r\n')
+                    conexao.enviar(b':' + nicks[conexao] + b' NICK ' + dado[1] + b'\r\n')
+                    nicks[conexao] = dado[1]
+                else:
+                    conexao.enviar(b':server 432 ' + nicks[conexao] + b' ' + dado[1] + b' :Erroneous nickname\r\n')
+                    
+        elif dado[0] == b'PRIVMSG':
+            remetente = nicks[conexao]
+            destinatario = dado[1]
+            if destinatario[0] == 35 and destinatario.lower() in [canal.lower() for canal in canais]:
+                canal = list(canais.keys())[[c.lower() for c in canais.keys()].index(dado[1].lower())]
+                if conexao in canais[canal]:
+                    for conexao_dest in canais[canal]:
+                        if conexao_dest != conexao:
+                            conexao_dest.enviar(b':' + remetente + b' PRIVMSG ' + canal + b' ' + dado[2] + b'\r\n')
+            elif destinatario.lower() in [nick.lower() for nick in nicks.values()]:
+                conexao_dest = list(nicks.keys())[[nick.lower() for nick in nicks.values()].index(destinatario.lower())]
+                conexao_dest.enviar(b':' + remetente + b' PRIVMSG ' + nicks[conexao_dest] + b' ' + dado[2] + b'\r\n')
+                
+        elif dado[0] == b'JOIN':
+            if dado[1][0] != 35 or not validar_nome(dado[1][1:]):
+                conexao.enviar(b':server 403 ' + dado[1] + b' :No such channel\r\n')
+            else:
+                if dado[1].lower() in [canal.lower() for canal in canais.keys()]:
+                    canal = list(canais.keys())[[c.lower() for c in canais.keys()].index(dado[1].lower())]
+                else:
+                    canal = dado[1]
+                    canais[canal] = []
+                template = b':server 353 ' + nicks[conexao] + b' = ' + canal + b' :'
+                if conexao not in canais[canal]:
+                    canais[canal].append(conexao)
+                    for conexao_dest in canais[canal]:
+                        conexao_dest.enviar(b':' + nicks[conexao] + b' JOIN :' + canal + b'\r\n')
+                    membros = sorted([nicks[membro] for membro in canais[canal]])
+                    msg = template
+                    for membro in membros:
+                        if (len(msg + membro) + 2 <= 510):
+                            msg += membro + b' '
+                        else:
+                            msg += b'\r\n'
+                            conexao.enviar(msg)
+                            msg = template + membro + b' '
+                    conexao.enviar(msg + b'\r\n')
+                    conexao.enviar(b':server 366 ' + nicks[conexao] + b' ' + canal + b' :End of /NAMES list.\r\n')
+                        
+        elif dado[0] == b'PART':
+            canal = list(canais.keys())[[c.lower() for c in canais.keys()].index(dado[1].lower())]
+            if conexao in canais[canal]:
+                for conexao_dest in canais[canal]:
+                    conexao_dest.enviar(b':' + nicks[conexao] + b' PART ' + canal + b'\r\n')
+                canais[canal].remove(conexao)
+            
+
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+    conexao.res = b''
+
+linha_serial = PTY()
+outra_ponta = '192.168.123.1'
+nossa_ponta = '192.168.123.2'
+
+print('Para conectar a outra ponta da camada física, execute:')
+print('  sudo slattach -v -p slip {}'.format(linha_serial.pty_name))
+print('  sudo ifconfig sl0 {} pointopoint {}'.format(outra_ponta, nossa_ponta))
+print()
+print('O serviço ficará acessível no endereço {}'.format(nossa_ponta))
+print()
+
+enlace = CamadaEnlace({outra_ponta: linha_serial})
+rede = IP(enlace)
+rede.definir_endereco_host(nossa_ponta)
+rede.definir_tabela_encaminhamento([
+    ('0.0.0.0/0', outra_ponta)
+])
+servidor = Servidor(rede, 7000)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
